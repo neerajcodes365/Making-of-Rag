@@ -1,0 +1,419 @@
+================================================================================
+ PDF RAG (Retrieval-Augmented Generation) - PROJECT REVISION NOTES
+ Local-first, terminal-based Q&A over your own PDFs
+ GitHub: https://github.com/neerajcodes365/Making-of-Rag
+================================================================================
+
+--------------------------------------------------------------------------------
+ 1. ONE-PARAGRAPH SUMMARY (the 30-second pitch)
+--------------------------------------------------------------------------------
+I built a terminal-based RAG system that answers questions about PDF documents.
+PDFs placed in a folder are split into small chunks, converted to vectors by a
+local embedding model (nomic-embed-text, running through Ollama), and stored in
+a persistent ChromaDB vector database. When I ask a question, it is embedded
+with the same model, the 5 most similar chunks are retrieved from ChromaDB, and
+they are passed together with the question to a local LLM (Mistral 7B via
+Ollama), which writes an answer using only that context. Everything runs
+locally: no PDF content leaves my machine and there is no API cost.
+
+The project is modeled on the open-source "rag-tutorial-v2" by Pixegami. I kept
+its simple structure, and adapted it to current LangChain versions, local
+embeddings + local LLM, and added Ollama pre-flight checks. (Be upfront about
+this in interviews: say it is based on that tutorial and say what YOU changed
+and understood. See section 11.)
+
+
+--------------------------------------------------------------------------------
+ 2. TECH STACK AT A GLANCE
+--------------------------------------------------------------------------------
+Language            : Python 3.13 (Windows, VS Code, virtual environment)
+Framework           : LangChain (used for glue: loaders, splitter, vector
+                      store wrapper, prompt template, Ollama wrappers)
+PDF parsing         : pypdf (via LangChain PyPDFDirectoryLoader)
+Text splitting      : RecursiveCharacterTextSplitter (langchain-text-splitters)
+Embedding model     : nomic-embed-text, served locally by Ollama
+                      - 768-dimensional vectors
+                      - ~137M parameters (v1.5), ~274 MB on disk
+Vector database     : ChromaDB (persistent, stored in the local "chroma/" folder)
+                      - approximate nearest-neighbour search (HNSW index)
+LLM (answers)       : Mistral 7B, served locally by Ollama (model name:
+                      "mistral", ~4.4 GB quantized download)
+Runtime for models  : Ollama (local server at http://localhost:11434)
+Interface           : Command line only (argparse). No web UI, no GUI.
+
+Pinned package versions (requirements.txt):
+   langchain-community==0.4.2     (PDF loader)
+   langchain-chroma==1.1.0        (Chroma vector store integration)
+   langchain-text-splitters==1.1.3
+   pypdf==6.19.0
+   langchain-ollama==1.1.0        (OllamaEmbeddings, OllamaLLM)
+   (chromadb, langchain-core, requests etc. come in as dependencies)
+
+
+--------------------------------------------------------------------------------
+ 3. PROJECT STRUCTURE
+--------------------------------------------------------------------------------
+rag_project/
+  data/
+    documents/                 <- you drop PDFs here
+  chroma/                      <- vector DB, created automatically, gitignored
+  get_embedding_function.py    <- ONE place that defines the embedding model
+  check_ollama.py              <- checks Ollama is running + models installed
+  populate_database.py         <- INGESTION: PDF -> chunks -> vectors -> Chroma
+  query_data.py                <- QUERY: question -> retrieval -> LLM -> answer
+  requirements.txt
+  .gitignore                   <- venv/, chroma/, __pycache__/, PDFs
+
+What each file does:
+
+get_embedding_function.py
+   Returns OllamaEmbeddings(model="nomic-embed-text"). Both ingestion and query
+   call this, which guarantees documents and questions are embedded by the
+   SAME model (required, otherwise the vectors are not comparable).
+
+check_ollama.py
+   Calls Ollama's /api/tags endpoint. If Ollama is not running, or a required
+   model is not installed, it exits with a clear message and the fix
+   (e.g. "ollama pull nomic-embed-text"). Without it, failures show up later as
+   long confusing stack traces.
+
+populate_database.py   (run when you add / change PDFs)
+   1. load_documents()    - reads every PDF in data/documents (one LangChain
+                            Document per PAGE, with metadata: source, page)
+   2. split_documents()   - splits pages into chunks (size 800, overlap 80)
+   3. calculate_chunk_ids() - gives each chunk an ID  "file.pdf:page:chunkIndex"
+   4. add_to_chroma()     - asks Chroma which IDs already exist, embeds ONLY
+                            the new chunks, saves them to chroma/
+   Flag: --reset  deletes chroma/ so you can rebuild from scratch.
+
+query_data.py          (run for every question)
+   1. check_ollama()      - preflight
+   2. embed the question  - same nomic-embed-text model
+   3. db.similarity_search_with_score(query, k=5) - top 5 closest chunks
+   4. build prompt        - context (the 5 chunks) + question + instructions
+   5. OllamaLLM(model="mistral").invoke(prompt) - generate the answer
+   6. print "Response: ..." and "Sources: [chunk IDs]"
+
+
+--------------------------------------------------------------------------------
+ 4. ARCHITECTURE / DATA FLOW
+--------------------------------------------------------------------------------
+
+ A) INGESTION PIPELINE   (python populate_database.py)
+
+    data/documents/*.pdf
+            |
+            v
+    PyPDFDirectoryLoader        -> 1 Document per page (text + source + page)
+            |
+            v
+    RecursiveCharacterTextSplitter (chunk_size=800, chunk_overlap=80)
+            |
+            v
+    Chunk IDs  ("data\documents\x.pdf:3:1")  -> skip IDs already in the DB
+            |
+            v
+    nomic-embed-text via Ollama (LOCAL)      -> 768-number vector per chunk
+            |
+            v
+    ChromaDB (persisted in chroma/)          -> vector + text + metadata
+
+
+ B) QUERY PIPELINE       (python query_data.py "your question")
+
+    Question (string)
+            |
+            v
+    nomic-embed-text via Ollama (LOCAL)      -> question vector
+            |
+            v
+    ChromaDB similarity search (top k = 5)   -> 5 most relevant chunks
+            |
+            v
+    Prompt = instructions + 5 chunks (context) + question
+            |
+            v
+    Mistral 7B via Ollama (LOCAL)            -> answer
+            |
+            v
+    Terminal: "Response: ..."  +  "Sources: [file:page:chunk, ...]"
+
+
+ C) HOW PYTHON TALKS TO OLLAMA
+    Ollama runs a local HTTP server on port 11434. LangChain's OllamaEmbeddings
+    and OllamaLLM send requests to it (the "ollama" Python client under the
+    hood). Model weights are loaded and run by Ollama, not by Python.
+
+
+--------------------------------------------------------------------------------
+ 5. KEY NUMBERS AND PARAMETERS (know these cold)
+--------------------------------------------------------------------------------
+chunk_size          800 characters (roughly 150-200 tokens, ~1-2 paragraphs)
+chunk_overlap       80 characters (so a sentence cut at a boundary appears in
+                    both neighbouring chunks)
+top_k               5 chunks retrieved per question
+embedding size      768 dimensions
+LLM                 Mistral 7B (7 billion parameters), run locally
+Chunk ID format     source:page:chunkIndex   e.g. data\documents\guide.pdf:0:3
+                    page is 0-BASED (":0:" = page 1 in a PDF viewer)
+Distance metric     Chroma's default is L2 (Euclidean) distance, and
+                    similarity_search_with_score returns a DISTANCE: lower =
+                    more similar. (Cosine similarity is the other common
+                    choice for text embeddings.)
+Test result         A test PDF (a C++-to-Java DSA guide) produced 14 chunks.
+                    A question "What is this document about?" returned a
+                    correct summary with 5 source chunks.
+
+
+--------------------------------------------------------------------------------
+ 6. HOW RAG WORKS (simple explanation)
+--------------------------------------------------------------------------------
+Problem: an LLM does not know your private PDFs, and cannot take a whole book
+as input (context-window limit, and it would be slow/expensive).
+
+RAG solution: "look it up first, then answer."
+  1. Pre-process: cut documents into small pieces and convert each piece into a
+     vector (an "embedding"): a list of numbers that captures its meaning.
+     Pieces with similar meaning end up close together in vector space.
+  2. At question time: convert the question into a vector, find the pieces
+     whose vectors are closest, and hand ONLY those pieces to the LLM.
+  3. The LLM answers from those pieces instead of from memory, which reduces
+     hallucination and allows citing sources.
+
+Why vectors instead of keyword search: embeddings match MEANING, so "how do I
+convert types" can retrieve a chunk that says "casting" without sharing words.
+
+
+--------------------------------------------------------------------------------
+ 7. DESIGN DECISIONS AND WHY (interviewers love this)
+--------------------------------------------------------------------------------
+Q: Why local embeddings and a local LLM?
+A: Privacy (PDF text never leaves the machine), zero API cost, no rate limits,
+   works offline. Trade-off: slower and lower answer quality than a large cloud
+   model, and it depends on my hardware.
+
+Q: Why Ollama?
+A: One tool to download and serve both models behind a simple local HTTP API;
+   LangChain has ready-made wrappers, so switching models is a one-line change.
+
+Q: Why nomic-embed-text?
+A: Small (~274 MB), good quality for retrieval, long input limit, runs fast on
+   CPU, available directly in Ollama.
+
+Q: Why ChromaDB?
+A: Simple, embedded (no server to run), persists to disk, and has a clean
+   LangChain integration. Fine for small/medium local collections.
+
+Q: Why Mistral 7B?
+A: Good quality for its size and runs on a normal laptop. It is a single line
+   in query_data.py, so it can be replaced (e.g. a 3B model if RAM is low, or a
+   cloud model later).
+
+Q: Why chunk the documents at all?
+A: (1) An embedding of a whole document is too blurry to match a specific
+   question. (2) The LLM's context window is limited. (3) Smaller chunks make
+   retrieval precise and keep the prompt short and fast.
+
+Q: Why 800 / 80?
+A: It is the starting point used by the tutorial, a reasonable paragraph-sized
+   chunk. It is NOT proven optimal; both are constants in the code and should
+   be tuned by testing retrieval quality on real questions.
+
+Q: Why overlap?
+A: So information that sits across a chunk boundary is not lost.
+
+Q: Why must the question and chunks use the same embedding model?
+A: Vectors from different models live in different spaces; distances between
+   them are meaningless.
+
+Q: How does the duplicate prevention work?
+A: Each chunk gets a deterministic ID (file:page:index). Before inserting, the
+   script fetches existing IDs from Chroma and only embeds chunks whose ID is
+   new. So re-running the script is cheap and does not create duplicates.
+
+Q: Why a separate get_embedding_function.py?
+A: A single swap point. Changing the embedding model means editing one file,
+   and it guarantees ingestion and querying cannot drift apart.
+
+Q: How do you reduce hallucination?
+A: The prompt tells the model to answer only from the provided context and to
+   say it could not find the answer otherwise; the answer is grounded in
+   retrieved chunks, and chunk IDs are printed as sources so it can be checked.
+
+
+--------------------------------------------------------------------------------
+ 8. THE PROMPT (what the LLM actually receives)
+--------------------------------------------------------------------------------
+   Answer the question based only on the following context:
+
+   {chunk 1}
+   ---
+   {chunk 2}
+   ---  ... (5 chunks)
+
+   ---
+
+   Answer the question based on the above context: {question}
+
+   If the answer is not in the context, say you could not find it in the
+   documents. Keep the answer concise.
+
+
+--------------------------------------------------------------------------------
+ 9. LIMITATIONS (be honest about these - it shows maturity)
+--------------------------------------------------------------------------------
+ - Add-only ingestion: if a PDF is edited but keeps its name, old chunks stay.
+   Fix: run populate_database.py --reset (or track a file hash per PDF).
+ - Scanned / image-only PDFs have no extractable text (would need OCR).
+ - Character-based chunking can split tables, code, or headings awkwardly.
+ - Always returns k=5 chunks even if none are truly relevant; there is no
+   similarity-score threshold, so the prompt instruction is the only guard.
+ - No re-ranking, no hybrid (keyword + vector) search, no chat memory: each
+   question is independent.
+ - Quality is bounded by a 7B local model; answers can be shallow on complex
+   multi-page reasoning.
+ - Speed depends on hardware: the first answer is slow while the model loads
+   into memory; CPU-only machines are slower.
+ - No automated evaluation of retrieval/answer quality.
+ - Page numbers in the printed sources are 0-based (a small UX wart).
+
+
+--------------------------------------------------------------------------------
+ 10. POSSIBLE IMPROVEMENTS (if asked "what would you do next?")
+--------------------------------------------------------------------------------
+ - Add a similarity-score cutoff so irrelevant questions return "not found"
+   without calling the LLM.
+ - Re-ranking (cross-encoder) or MMR to improve relevance and diversity.
+ - Hybrid search: BM25 keyword + vector search.
+ - Smarter chunking (by headings / sentences) and token-based sizes.
+ - Incremental updates using a per-file content hash (detect edited PDFs).
+ - OCR for scanned PDFs.
+ - Pretty source citations ("file.pdf, page 4") and streaming the answer.
+ - Evaluation set of questions with expected answers (e.g. RAGAS-style
+   metrics: retrieval hit rate, faithfulness).
+ - A pluggable LLM layer to switch between local Ollama and a cloud model.
+ - Conversation memory for follow-up questions.
+
+
+--------------------------------------------------------------------------------
+ 11. WHAT I CHANGED FROM THE ORIGINAL TUTORIAL (be ready to explain)
+--------------------------------------------------------------------------------
+ - Updated all imports for current LangChain 1.x (the tutorial's langchain.*
+   import paths no longer exist): langchain_chroma, langchain_core,
+   langchain_community, langchain_ollama.
+ - Embeddings: tutorial defaulted to AWS Bedrock; I use local nomic-embed-text.
+ - Moved to the maintained langchain-ollama classes (OllamaEmbeddings,
+   OllamaLLM) to remove deprecation warnings.
+ - Added check_ollama.py: pre-flight check for the Ollama server and models.
+ - Reads PDFs from data/documents/, small prompt improvement (say "not found").
+ - Removed db.persist() (Chroma now persists automatically).
+ - Wrote a .gitignore and published to GitHub.
+
+
+--------------------------------------------------------------------------------
+ 12. PROBLEMS I RAN INTO (good "challenges faced" stories)
+--------------------------------------------------------------------------------
+ 1. Outdated tutorial imports -> ModuleNotFoundError on current LangChain;
+    fixed by migrating to the new package layout.
+ 2. pip timeouts while downloading chromadb on a slow connection; fixed with
+    --default-timeout and --retries.
+ 3. "ollama" not recognised in the terminal (PATH not refreshed after install);
+    fixed by restarting VS Code / calling the full path to ollama.exe.
+ 4. Ollama out-of-memory / CUDA error when loading Mistral; the model worked
+    when run directly after memory was free. Fallback: run on CPU with
+    OllamaLLM(model="mistral", num_gpu=0), or use a smaller model.
+ 5. PDFs placed in data/ instead of data/documents/ -> nothing to index;
+    fixed the folder layout.
+
+
+--------------------------------------------------------------------------------
+ 13. HOW TO RUN (quick reference, Windows)
+--------------------------------------------------------------------------------
+ One-time setup:
+   - Install Ollama, then:  ollama pull nomic-embed-text
+                            ollama pull mistral
+   - python -m venv venv
+   - venv\Scripts\activate
+   - pip install -r requirements.txt
+
+ Every session:
+   - venv\Scripts\activate           (prompt shows "(venv)")
+   - make sure the Ollama app is running (system tray)
+
+ Index PDFs (after adding files to data\documents\):
+   python populate_database.py
+   (python populate_database.py --reset   to rebuild from scratch)
+
+ Ask a question:
+   python query_data.py "What is this document about?"
+
+ Output looks like:
+   Response: <answer>
+   Sources: ['data\\documents\\file.pdf:0:3', ...]
+
+
+--------------------------------------------------------------------------------
+ 14. LIKELY INTERVIEW QUESTIONS - QUICK ANSWERS
+--------------------------------------------------------------------------------
+ What is an embedding?
+   A fixed-length numeric vector representing the meaning of a piece of text;
+   similar meanings give nearby vectors.
+
+ How does the vector DB find similar chunks quickly?
+   Chroma uses an approximate nearest-neighbour index (HNSW), a graph-based
+   structure, instead of comparing the query against every vector.
+
+ L2 vs cosine similarity?
+   L2 measures straight-line distance, cosine measures the angle between
+   vectors (ignores length). For normalized embeddings they rank results
+   almost the same. Chroma's default here is L2, and lower score = closer.
+
+ What happens if the answer is not in the documents?
+   The 5 nearest chunks are still returned (no threshold), so the prompt tells
+   the LLM to say it could not find the answer. A score cutoff would be a
+   stronger guard.
+
+ Why not just paste the whole PDF into the LLM?
+   Context-window limits, slower and costlier inference, and the model can lose
+   details in very long inputs. Retrieval sends only the relevant parts.
+
+ What is the context window problem here?
+   The prompt (5 chunks of ~800 characters + question) is small, so it fits
+   easily within the model's context window (Ollama's default window is a few
+   thousand tokens; check your Ollama version).
+
+ How would you scale this to thousands of documents?
+   Move to a server-based vector DB, use batched/parallel embedding with a GPU,
+   add metadata filtering, re-ranking, and incremental indexing.
+
+ How would you evaluate it?
+   Build a question set with known answers/pages, measure retrieval hit rate
+   (is the right chunk in the top k?) and answer faithfulness; tune chunk size,
+   overlap and k against those numbers.
+
+ Is any data sent to the cloud?
+   No. PDF parsing, embeddings, vector search and the LLM all run locally.
+
+ What would you change to use a cloud LLM?
+   Replace the single line that builds the LLM in query_data.py with another
+   LangChain chat model; retrieval and the rest of the pipeline stay the same.
+
+
+--------------------------------------------------------------------------------
+ 15. RESUME BULLET IDEAS (edit to match what you can defend)
+--------------------------------------------------------------------------------
+ - Built a local, terminal-based Retrieval-Augmented Generation (RAG) system to
+   answer questions over PDF documents using LangChain, ChromaDB, and Ollama
+   (nomic-embed-text embeddings, Mistral 7B), with no data leaving the machine.
+ - Implemented PDF ingestion with recursive chunking (800/80), deterministic
+   chunk IDs for duplicate-free incremental indexing, and persistent vector
+   storage; top-5 semantic retrieval with source citations.
+ - Added Ollama health/model pre-flight checks and migrated the codebase to
+   current LangChain APIs; published on GitHub.
+
+ Tip: only list numbers you have measured yourself. If you test retrieval
+ quality (hit rate, response time), add those figures here before the interview.
+
+================================================================================
+ END
+================================================================================
